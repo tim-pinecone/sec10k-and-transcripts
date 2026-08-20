@@ -1,28 +1,38 @@
-"""Upload staged parquet to the public S3 bucket.
+"""Convert staged Parquet to gzipped JSONL and upload it to the public S3 bucket.
 
-Resumable by construction: the check for "already done" is a `head_object` against S3
-comparing size, so the bucket itself is the source of truth. A local checkpoint would
-be a second, weaker copy of that same fact — and would happily skip a file that was
-never actually uploaded.
+FTS bulk import reads JSONL, not Parquet, so each staged Parquet part is converted on
+the way out rather than kept on disk in both formats. Conversion is pure CPU with
+nothing to pay for, so re-doing it on a retry is free.
+
+Resumable by construction: "already done" is the existence of the S3 key. S3 multipart
+uploads are atomic — an object appears only once it is complete — so presence is a
+sound completeness signal. Size comparison is not usable here because the local file is
+Parquet and the remote one is gzipped JSONL.
 """
 
 from __future__ import annotations
 
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import boto3
 from botocore.exceptions import ClientError
 
+from .jsonl import jsonl_key_for, write_jsonl_gz
 from .layout import s3_key
 from .progress import Progress
 
 
 @dataclass
 class UploadPlan:
-    """What needs uploading, decided before any bytes move."""
+    """What needs uploading, decided before any bytes move.
 
-    to_upload: list[tuple[Path, str, int]]  # (local path, s3 key, size)
+    Sizes are the *Parquet* sizes, used only to weight the progress bar; the bytes
+    actually transferred are the gzipped JSONL, roughly 1.5x larger.
+    """
+
+    to_upload: list[tuple[Path, str, int]]  # (parquet path, s3 jsonl key, parquet size)
     skipped: int
     skipped_bytes: int
 
@@ -57,22 +67,19 @@ def plan_upload(
     skipped = skipped_bytes = 0
 
     for path in staged_files(staging_dir, dataset):
-        key = s3_key(prefix, _relative_key(staging_dir, dataset, path))
+        key = s3_key(
+            prefix, jsonl_key_for(_relative_key(staging_dir, dataset, path))
+        )
         size = path.stat().st_size
         try:
-            head = s3.head_object(Bucket=bucket, Key=key)
+            s3.head_object(Bucket=bucket, Key=key)
         except ClientError as exc:
             if exc.response["Error"]["Code"] not in ("404", "NoSuchKey"):
                 raise
             to_upload.append((path, key, size))
             continue
-        # Same size means already uploaded. A truncated upload would differ in size,
-        # because parquet parts are written locally by atomic rename.
-        if head["ContentLength"] == size:
-            skipped += 1
-            skipped_bytes += size
-        else:
-            to_upload.append((path, key, size))
+        skipped += 1
+        skipped_bytes += size
 
     return UploadPlan(to_upload=to_upload, skipped=skipped, skipped_bytes=skipped_bytes)
 
@@ -104,11 +111,23 @@ def upload(
         total=plan.total_bytes,
         status_path=status_path,
     )
-    for path, key, size in plan.to_upload:
-        # boto3's upload_file switches to multipart automatically for large parts.
-        s3.upload_file(str(path), bucket, key)
-        prog.advance(size, current=key)
-    prog.finish(f"{len(plan.to_upload):,} parts, {plan.total_bytes / 1e9:.2f} GB")
+    documents = uploaded_bytes = 0
+    with tempfile.TemporaryDirectory(prefix="finvec-jsonl-") as scratch:
+        for path, key, size in plan.to_upload:
+            # Converted to a scratch file rather than streamed, so a failed upload
+            # never leaves a partial object and the temp file is reclaimed either way.
+            local = Path(scratch) / "part.jsonl.gz"
+            count, gz_bytes = write_jsonl_gz(path, local)
+            # boto3 switches to multipart automatically for large parts.
+            s3.upload_file(str(local), bucket, key)
+            local.unlink()
+            documents += count
+            uploaded_bytes += gz_bytes
+            prog.advance(size, current=key, docs=f"{documents:,}")
+    prog.finish(
+        f"{len(plan.to_upload):,} parts, {documents:,} documents, "
+        f"{uploaded_bytes / 1e9:.2f} GB of jsonl.gz"
+    )
     return plan
 
 
@@ -145,14 +164,13 @@ def prune_uploaded(
     deleted = kept = freed = 0
 
     for path in staged_files(staging_dir, dataset):
-        key = s3_key(prefix, _relative_key(staging_dir, dataset, path))
+        key = s3_key(
+            prefix, jsonl_key_for(_relative_key(staging_dir, dataset, path))
+        )
         size = path.stat().st_size
         try:
-            head = s3.head_object(Bucket=bucket, Key=key)
+            s3.head_object(Bucket=bucket, Key=key)
         except ClientError:
-            kept += 1
-            continue
-        if head["ContentLength"] != size:
             kept += 1
             continue
         freed += size

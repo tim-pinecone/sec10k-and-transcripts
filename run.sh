@@ -20,7 +20,7 @@ DETACH=0
 ASSUME_YES=0
 PRUNE=0
 CONCURRENCY=8
-STAGES="preflight,stage,compact,s3,upload,import,verify"
+STAGES="preflight,stage,compact,probe,s3,upload,import,verify"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -131,6 +131,15 @@ fi
 if has_stage compact; then
   say "compact — coalesce per-shard parts"
   uv run finvec compact sec
+fi
+
+# ── Schema gate ──────────────────────────────────────────────────────────────
+# Round-trips real staged documents through documents.upsert before anything large
+# is uploaded. FTS schemas are immutable, and import validates documents through the
+# same code path as upsert, so a clean probe here means a clean import later.
+if has_stage probe; then
+  say "probe-schema — validate schema + document contract on live index"
+  uv run finvec probe-schema sec
 fi
 
 # ── S3 ───────────────────────────────────────────────────────────────────────

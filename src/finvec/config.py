@@ -20,15 +20,19 @@ load_dotenv()
 
 EMBED_MODEL = "text-embedding-3-small"
 EMBED_DIMS = 1536
-# dotproduct, not cosine: OpenAI embeddings are L2-normalized so the two are
-# numerically identical here, but only dotproduct permits adding sparse vectors to
-# the same index later for hybrid search.
-METRIC = "dotproduct"
 # Bulk import from S3 only reaches AWS-hosted indexes.
 CLOUD = "aws"
 
-SEC_INDEX = "sec-10k-index"
-TRANSCRIPTS_INDEX = "sp500-transcripts-index"
+# Full-text search runs on its own API version, and every FTS request must carry it.
+FTS_API_VERSION = "2026-01.alpha"
+# Cosine, not dotproduct: our embeddings are L2-normalized so the two are numerically
+# identical, and FTS has a dedicated sparse_vector field type, so the "keep dotproduct
+# for future in-index hybrid" argument that applies to classic indexes does not apply
+# here.
+FTS_METRIC = "cosine"
+
+SEC_INDEX = "sec-10k-fts"
+TRANSCRIPTS_INDEX = "sp500-transcripts-fts"
 
 SEC_DATASET = "astr010/sec-10k-lsh-chunks"
 SEC_SHARD_COUNT = 1380

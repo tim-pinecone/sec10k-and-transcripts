@@ -8,7 +8,7 @@ dependencies = [
     "boto3>=1.43.75",
     "datasets>=5.0.1",
     "openai>=3.3.1",
-    "pinecone[grpc]>=9.1.0",
+    "pinecone[grpc]==9.1.0",
     "pyarrow>=25.0.1",
     "pydantic-settings>=2.15.0",
     "python-dotenv>=1.2.3",

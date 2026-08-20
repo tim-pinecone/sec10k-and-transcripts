@@ -13,16 +13,50 @@ call transcripts, partitioned into year namespaces and loaded via bulk import fr
 
 ## Architecture (decided — see PLAN_REVIEW.md for the reasoning)
 
-Two serverless indexes, **AWS-hosted** (bulk import from S3 only reaches AWS indexes):
+Two **FTS document-schema** indexes, **AWS-hosted** (S3 import only reaches AWS):
 
-| Index | Records | Namespaces | Size @1536d |
-|---|---|---|---|
-| `sec-10k-index` | ~13.58M | `2004`…`2025` (fiscal_year) | ~108 GB |
-| `sp500-transcripts-index` | ~1.5M chunks from 33,362 calls | `2005`…`2025` (year) | ~12 GB |
+| Index | Documents | Namespaces |
+|---|---|---|
+| `sec-10k-fts` | ~4.1M merged chunks | `2004`…`2025` (fiscal_year) |
+| `sp500-transcripts-fts` | ~1.5M chunks from 33,362 calls | `2005`…`2025` (year) |
 
-Metric is **`dotproduct`** — OpenAI embeddings are L2-normalized, so dotproduct is
-numerically identical to cosine, but it leaves the door open to hybrid dense+sparse in
-a single index later. Cosine would foreclose that.
+FTS replaces the classic dense indexes: one index serves BM25, dense semantic, and
+hybrid (dense ranking with a `$match_all` lexical hard filter) — a shape the classic
+index cannot express at all. See **FTS_DESIGN.md** for the full rationale.
+
+**The schema declares two fields and nothing else:**
+
+```python
+SchemaBuilder()
+  .add_string_field("text", full_text_search={"language": "en", "stemming": True})
+  .add_dense_vector_field("embedding", dimension=1536, metric="cosine")
+```
+
+Metadata-only declarations (`float`, `boolean`, plain `string`, `string_list`) are
+**rejected at index creation** — every filterable field (ticker, fiscal_year,
+is_boilerplate, …) is auto-indexed at upsert with the full operator set and must NOT be
+declared. Metric is cosine because our embeddings are L2-normalized (measured norm
+1.0001) and FTS has a dedicated `sparse_vector` field, so the dotproduct-for-future-
+hybrid argument doesn't apply here.
+
+FTS specifics that bite:
+
+- **Bulk import files are JSONL** (`.jsonl` / `.jsonl.gz`), not Parquet, and unlike
+  Parquet, undeclared fields are **stored** rather than ignored.
+- **Bulk import is REST-only** — "not yet supported in any Pinecone SDK." Requests go to
+  the index host with `X-Pinecone-Api-Version: 2026-01.alpha`.
+- **`describe_index_stats` is unsupported** on document-schema indexes. Namespace
+  existence is discovered by attempting the import; completeness is checked against each
+  import's own `records_imported`.
+- **An array of numbers in an undeclared field is rejected.** `source_chunk_ids` must
+  stay a list of *strings*.
+- Numbers are stored as floating point, so `fiscal_year` reads back as `2024.0`.
+- Schemas are immutable, `pinecone.preview` is outside SemVer (SDK pinned to `==9.1.0`),
+  and there is no backup/restore for document-schema indexes.
+
+Run `finvec probe-schema` before any large import: it round-trips real staged documents
+through `documents.upsert`, which the docs guarantee is the same validation path as
+import.
 
 Pipeline is strictly staged, and every stage is resumable:
 

@@ -9,18 +9,38 @@ said on the Q3 call?" and get both sides.
 
 ## What's in it
 
-| Index | Source | Records | Namespaces |
+| Index | Source | Documents | Namespaces |
 |---|---|---|---|
-| `sec-10k-index` | [`astr010/sec-10k-lsh-chunks`](https://huggingface.co/datasets/astr010/sec-10k-lsh-chunks) | 13,578,263 chunks · 1,380 companies · 2004–2025 | fiscal year |
-| `sp500-transcripts-index` | [`Bose345/sp500_earnings_transcripts`](https://huggingface.co/datasets/Bose345/sp500_earnings_transcripts) | ~1.5M speaker-turn chunks from 33,362 calls · 2005–2025 | calendar year |
+| `sec-10k-fts` | [`astr010/sec-10k-lsh-chunks`](https://huggingface.co/datasets/astr010/sec-10k-lsh-chunks) | ~4.1M merged chunks · 1,380 companies · 2004–2025 | fiscal year |
+| `sp500-transcripts-fts` | [`Bose345/sp500_earnings_transcripts`](https://huggingface.co/datasets/Bose345/sp500_earnings_transcripts) | ~1.5M speaker-turn chunks from 33,362 calls · 2005–2025 | calendar year |
+
+Both are Pinecone **full-text-search document-schema** indexes, so one index serves three
+retrieval shapes:
+
+```python
+# BM25 keyword
+score_by=[{"type": "text", "field": "text", "query": "supply chain disruption"}]
+
+# Dense semantic
+score_by=[{"type": "dense_vector", "field": "embedding", "values": q}]
+
+# Hybrid — semantic ranking, hard lexical requirement
+score_by=[{"type": "dense_vector", "field": "embedding", "values": q}],
+filter={"text": {"$match_all": "Azure"}, "ticker": {"$eq": "MSFT"}}
+```
+
+That third shape is the one that matters for financial text: "what does MSFT say about
+Azure capex" needs semantic intent *and* a guarantee the term is actually present.
 
 Design notes worth knowing before you run anything:
 
 - **Year namespaces, not one flat namespace.** Pinecone read units scale with
   *namespace* size, so a single-year query costs ~3 RU instead of ~108 RU — 22× cheaper
   — while a full-corpus fan-out via `query_namespaces` costs the same either way.
-- **Bulk import from S3, not upsert.** Import is $0.25/GB; upserting the same 13.6M
-  records burns ~$424 in write units. Same data, ~16× the price.
+- **Bulk import from S3, not upsert.** Import is $0.25/GB; upserting the same corpus
+  burns hundreds of dollars in write units. Files are JSONL (`.jsonl.gz`) because the
+  indexes use document schemas, and the import is driven over REST — it is not yet in
+  any Pinecone SDK.
 - **Boilerplate is indexed, not discarded.** The source dataset flags LSH-detected
   boilerplate. It's kept in metadata as `is_boilerplate`, so you can filter it out at
   query time (`filter={"is_boilerplate": False}`) or search it deliberately — instead
@@ -62,24 +82,39 @@ account, no IAM role, and no console setup — just an index of the right shape 
 call per year:
 
 ```python
-from pinecone import Pinecone, ServerlessSpec, ImportErrorMode
+import requests
+from pinecone import Pinecone
+from pinecone.preview import SchemaBuilder
 
 pc = Pinecone(api_key="...")
-pc.create_index(
-    name="sec-10k-index",
-    dimension=1536,
-    metric="dotproduct",
-    spec=ServerlessSpec(cloud="aws", region="us-east-1"),  # must be AWS
+pc.preview.indexes.create(
+    name="sec-10k-fts",
+    schema=(
+        SchemaBuilder()
+        .add_string_field("text", full_text_search={"language": "en", "stemming": True})
+        .add_dense_vector_field("embedding", dimension=1536, metric="cosine")
+        .build()
+    ),
+    deployment={"deployment_type": "managed", "cloud": "aws", "region": "us-east-1"},
 )
-index = pc.Index(host=pc.describe_index("sec-10k-index").host)
+host = pc.preview.indexes.describe("sec-10k-fts").host
 
+# Bulk import is REST-only for document schemas — not yet in any Pinecone SDK.
 for year in range(2004, 2026):
-    index.start_import(
-        uri=f"s3://{BUCKET}/{PREFIX}/sec/import-{year}/",  # note: import-{year}/
-        error_mode=ImportErrorMode.CONTINUE,
-        # no integration_id — the bucket is public
-    )
+    requests.post(
+        f"https://{host}/bulk/imports",
+        headers={"Api-Key": KEY, "X-Pinecone-Api-Version": "2026-01.alpha"},
+        json={
+            "uri": f"s3://{BUCKET}/{PREFIX}/sec/import-{year}/",  # note: import-{year}/
+            "errorMode": {"onError": "continue"},
+            # no integrationId — the bucket is public
+        },
+    ).raise_for_status()
 ```
+
+Declare nothing but those two fields: metadata-only declarations are rejected at index
+creation, and every other field (`ticker`, `fiscal_year`, `is_boilerplate`, …) is
+auto-indexed as filterable metadata straight from the JSONL.
 
 Each year is a separate import into its own namespace, so a failure costs you one year
 rather than the whole corpus. Point `uri` at `.../sec/` instead of `.../sec/import-2004/`
@@ -151,6 +186,7 @@ where it left off.
 uv run finvec profile                    # measure corpus + project cost (free)
 uv run finvec stage sec                  # merge + embed → staging/sec/import-{year}/{year}/
 uv run finvec compact sec                # coalesce per-shard parts (free, optional)
+uv run finvec probe-schema sec           # validate schema on live index (~60 docs)
 uv run finvec s3-setup                   # dry run; --apply to create the public bucket
 uv run finvec upload sec                 # staging → s3://$S3_BUCKET/$S3_PREFIX
 uv run finvec prune sec                  # dry run; --apply to reclaim ~33 GB of disk
