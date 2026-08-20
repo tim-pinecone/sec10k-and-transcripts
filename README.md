@@ -39,6 +39,10 @@ Running the **full** corpus is not free. Measured, not guessed:
 | Pinecone storage (~120 GB @ $0.33/GB) | — | ~$40 |
 | Pinecone Standard plan minimum | — | $50 |
 
+Disk: staging the full corpus locally is ~33 GB before upload. `finvec prune --apply`
+(or `run.sh --prune`) deletes local parts once each one is individually confirmed
+present in S3 at the same size.
+
 You need:
 
 - A Pinecone **Standard** plan — Starter caps storage at 2 GB and Builder at 10 GB,
@@ -103,16 +107,55 @@ cp .env.example .env
 
 ## Usage
 
-The pipeline is staged, and every stage is resumable — kill any of them and re-run the
-same command to pick up where it left off.
+### One command, start to finish
+
+```bash
+./run.sh                              # full corpus, foreground, logged
+./run.sh --shards 0-9                 # smoke run over 10 companies (cents)
+./run.sh --detach --yes --prune       # background; monitor with ./watch.sh
+./run.sh --stages stage,upload        # run only some stages
+```
+
+`run.sh` logs into AWS via SSO, preflights the keys and free disk, embeds the corpus,
+uploads to S3, imports into Pinecone, and verifies the counts. Every stage is resumable,
+so the script itself is safe to re-run — it skips work already paid for. Output is teed
+to `logs/latest.log`.
+
+Monitor a run from another shell:
+
+```bash
+./watch.sh          # live progress, rate, ETA, import status, log tail
+tail -f logs/latest.log
+cat data/state/status.json
+```
+
+**Sequencing matters if you smoke-test first.** A partial import creates real
+namespaces, and imports cannot add to an existing namespace — later runs *skip* it, so
+the year silently keeps only its smoke-test subset. Either smoke-test without the
+import stage:
+
+```bash
+./run.sh --shards 0-9 --stages preflight,stage,compact,s3,upload
+```
+
+or drop the namespaces afterwards (`finvec drop-namespace sec <year>`) before the full
+run. `finvec verify` compares live counts against staged row counts specifically to
+catch this.
+
+### Individual stages
+
+Every stage is resumable — kill any of them and re-run the same command to pick up
+where it left off.
 
 ```bash
 uv run finvec profile                    # measure corpus + project cost (free)
 uv run finvec stage sec                  # merge + embed → staging/sec/import-{year}/{year}/
+uv run finvec compact sec                # coalesce per-shard parts (free, optional)
 uv run finvec s3-setup                   # dry run; --apply to create the public bucket
 uv run finvec upload sec                 # staging → s3://$S3_BUCKET/$S3_PREFIX
+uv run finvec prune sec                  # dry run; --apply to reclaim ~33 GB of disk
 uv run finvec import sec                 # one import per year namespace, polled together
-uv run finvec verify sec                 # per-namespace record counts
+uv run finvec verify sec                 # staged vs. live counts, flags incompleteness
 uv run finvec drop-namespace sec 2024    # required before re-importing a year
 uv run finvec search "supply chain risk" --year 2024 --ticker NVDA
 ```

@@ -14,7 +14,8 @@ from typing import Optional
 import typer
 
 from . import profile as profile_mod
-from . import pinecone_ops, s3_setup, upload as upload_mod
+from . import compact as compact_mod
+from . import pinecone_ops, s3_setup, stage as stage_mod, upload as upload_mod
 from .config import SEC_INDEX, TRANSCRIPTS_INDEX, settings
 
 app = typer.Typer(
@@ -68,19 +69,54 @@ def profile(
 
 @app.command()
 def stage(
-    dataset: str = typer.Argument(..., help="'sec' or 'transcripts'."),
+    dataset: str = typer.Argument("sec", help="'sec' or 'transcripts'."),
     shards: Optional[str] = typer.Option(
-        None, help="Shard range for a smoke run, e.g. '0-4'. Default: all."
+        None, help="Shard range for a smoke run, e.g. '0-4' or '0-2,10'. Default: all."
+    ),
+    concurrency: int = typer.Option(8, help="Concurrent embedding requests."),
+) -> None:
+    """Merge, embed, and write staging/{dataset}/import-{year}/{year}/*.parquet.
+
+    Resumable per source shard: kill it and re-run the same command, and it re-embeds
+    at most one shard's worth of work.
+    """
+    _require_dataset(dataset)
+    if dataset != "sec":
+        typer.secho(
+            "only `sec` staging is implemented; the transcripts chunker is built but "
+            "its shard reader is not wired up yet.",
+            fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit(1)
+    s = settings()
+    s.require("openai_api_key")
+    stage_mod.stage(
+        s.staging_dir,
+        _state_dir(),
+        stage_mod.parse_shard_range(shards),
+        concurrency=concurrency,
+        dataset=dataset,
+        status_path=_state_dir() / "status.json",
+    )
+
+
+@app.command()
+def compact(
+    dataset: str = typer.Argument("sec", help="'sec' or 'transcripts'."),
+    target_mb: int = typer.Option(400, help="Target size per output part, in MB."),
+    keep_inputs: bool = typer.Option(
+        False, help="Keep the per-shard files instead of deleting them."
     ),
 ) -> None:
-    """Merge, embed, and write staging/{dataset}/import-{year}/{year}/*.parquet."""
+    """Coalesce per-shard parquet parts into fewer, larger ones. Optional, free."""
     _require_dataset(dataset)
-    typer.secho(
-        "`stage` is not implemented yet. The S3 and import stages below are ready; "
-        "staging (merge + embed + parquet) is next.",
-        fg=typer.colors.YELLOW,
+    compact_mod.compact(
+        settings().staging_dir,
+        dataset,
+        target_bytes=target_mb * 1024 * 1024,
+        keep_inputs=keep_inputs,
+        status_path=_state_dir() / "status.json",
     )
-    raise typer.Exit(1)
 
 
 @app.command("s3-setup")
@@ -158,6 +194,28 @@ def upload_cmd(
             s.s3_prefix,
             region=s.aws_region,
             status_path=_state_dir() / "status.json",
+        )
+
+
+@app.command()
+def prune(
+    dataset: str = typer.Argument("sec", help="'sec' or 'transcripts'."),
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually delete. Default is a dry run."
+    ),
+) -> None:
+    """Delete local staged parts already confirmed in S3, to reclaim disk.
+
+    Each file is checked individually against S3 by key and size before removal;
+    anything not confirmed is kept. Staging the full corpus is ~33 GB.
+    """
+    _require_dataset(dataset)
+    s = settings()
+    s.require("s3_bucket")
+    with s3_setup.friendly_aws_errors():
+        upload_mod.prune_uploaded(
+            s.staging_dir, dataset, s.s3_bucket, s.s3_prefix,
+            region=s.aws_region, dry_run=not apply,
         )
 
 
@@ -246,19 +304,66 @@ def drop_namespace_cmd(
 
 @app.command()
 def verify(
-    dataset: str = typer.Argument(..., help="'sec' or 'transcripts'."),
+    dataset: str = typer.Argument("sec", help="'sec' or 'transcripts'."),
 ) -> None:
-    """Report per-namespace record counts from the live index."""
+    """Compare live per-namespace counts against what was staged.
+
+    Live counts alone cannot show a namespace is *complete*. The dangerous failure
+    here is silent incompleteness: a namespace created by an earlier partial import is
+    skipped by later imports, so it keeps whatever subset it started with and no error
+    is ever raised. Comparing against staged row counts is what catches that.
+    """
     _require_dataset(dataset)
+    s = settings()
+    expected = upload_mod.expected_counts(s.staging_dir, dataset)
     index = _open_index(dataset)
-    counts = pinecone_ops.namespace_counts(index)
-    if not counts:
-        typer.echo("no namespaces yet")
+    actual = pinecone_ops.namespace_counts(index)
+
+    if not expected and not actual:
+        typer.echo("nothing staged and nothing imported")
         return
-    total = sum(counts.values())
-    for namespace in sorted(counts):
-        typer.echo(f"  {namespace}  {counts[namespace]:>12,}")
-    typer.echo(f"  {'TOTAL':<5} {total:>12,} across {len(counts)} namespaces")
+    if not expected:
+        typer.secho(
+            "no staged parquet found, so live counts cannot be checked for "
+            "completeness — showing them unverified.",
+            fg=typer.colors.YELLOW,
+        )
+
+    namespaces = sorted(set(expected) | set(actual))
+    typer.echo(f"  {'ns':<6}{'staged':>14}{'in pinecone':>14}{'diff':>12}")
+    problems = []
+    for namespace in namespaces:
+        want = expected.get(namespace, 0)
+        got = actual.get(namespace, 0)
+        diff = got - want
+        flag = ""
+        if expected and diff != 0:
+            # Import skips records it cannot parse, so a small shortfall is possible;
+            # any difference is still worth surfacing rather than rounding away.
+            flag = "  <-- MISMATCH"
+            problems.append(namespace)
+        typer.echo(
+            f"  {namespace:<6}{want:>14,}{got:>14,}{diff:>+12,}{flag}"
+        )
+    typer.echo(
+        f"  {'TOTAL':<6}{sum(expected.values()):>14,}{sum(actual.values()):>14,}"
+        f"{sum(actual.values()) - sum(expected.values()):>+12,}"
+    )
+
+    if problems:
+        typer.secho(
+            f"\n{len(problems)} namespace(s) do not match what was staged: "
+            f"{', '.join(problems)}\n"
+            f"A namespace that already existed was skipped rather than topped up — "
+            f"imports cannot add to an existing namespace. To fix one:\n"
+            f"  uv run finvec drop-namespace {dataset} <year>\n"
+            f"  uv run finvec import {dataset} --namespaces <year>",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(1)
+    if expected:
+        typer.secho("\nall namespaces match the staged record counts",
+                    fg=typer.colors.GREEN)
 
 
 @app.command()

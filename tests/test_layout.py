@@ -57,3 +57,43 @@ def test_assert_import_uri_catches_a_year_mismatch():
 def test_s3_key_tolerates_stray_slashes_and_empty_prefix():
     assert s3_key("/p/v1/", "sec/x.parquet") == "p/v1/sec/x.parquet"
     assert s3_key("", "sec/x.parquet") == "sec/x.parquet"
+
+
+def test_compaction_never_overwrites_an_existing_part(tmp_path):
+    """Stage interrupted -> compact -> stage resumes -> compact must append, not clobber.
+
+    Restarting part numbering at 0 would replace the first part with only the newly
+    staged records, losing everything compacted earlier — with no error.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from finvec.compact import compact_namespace
+
+    d = tmp_path / "import-2024" / "2024"
+    d.mkdir(parents=True)
+
+    def write(name, ids):
+        pq.write_table(
+            pa.table({
+                "id": pa.array(ids, pa.string()),
+                "values": pa.array([[0.1, 0.2]] * len(ids), pa.list_(pa.float32())),
+                "metadata": pa.array(["{}"] * len(ids), pa.string()),
+            }),
+            d / name,
+        )
+
+    write("shard-00001.parquet", ["a", "b"])
+    assert compact_namespace(d) == (1, 1)
+    assert (d / "part-00000.parquet").exists()
+
+    # A later staging pass produces another shard file for the same year.
+    write("shard-00002.parquet", ["c", "d"])
+    assert compact_namespace(d) == (1, 1)
+
+    parts = sorted(d.glob("part-*.parquet"))
+    assert [p.name for p in parts] == ["part-00000.parquet", "part-00001.parquet"]
+    all_ids = sorted(
+        i for p in parts for i in pq.read_table(p)["id"].to_pylist()
+    )
+    assert all_ids == ["a", "b", "c", "d"], "records lost during recompaction"

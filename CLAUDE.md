@@ -157,6 +157,37 @@ unique on `(symbol, year, quarter)`, and a collision would silently overwrite.
 Never spend embedding money without running `profile` first — it measures real token
 counts and the `is_boilerplate` fraction and prints a projected cost table.
 
+## Running it
+
+`./run.sh` is the orchestrator: AWS SSO login -> preflight -> stage -> compact ->
+s3-setup -> upload -> [prune] -> import -> verify. `./watch.sh` is the live monitor,
+reading `data/state/status.json` and `logs/latest.log`.
+
+Because every stage is resumable, `run.sh` has no phase markers — re-running it is the
+recovery mechanism. Preflight checks keys, the AWS identity, and free disk *before*
+anything expensive starts.
+
+### Staging checkpoint unit
+
+One source shard = one company = ~10k chunks. Chosen because it is the unit the source
+publishes, it costs seconds to redo, and a shard's output is written atomically. A shard
+spans ~10-20 fiscal years, so it writes one `shard-{NNNNN}.parquet` into each of those
+years' namespace directories; `compact` coalesces those into `part-{NNNNN}.parquet` of
+~400 MB.
+
+`compact` numbers new parts *after* any existing ones. Restarting at `part-00000` would
+overwrite the previous part with only the newly staged records — silent data loss when
+staging is interrupted, compacted, resumed, and compacted again. Covered by a test.
+
+### The silent-incompleteness trap
+
+An import cannot add to a namespace that already exists; `start_import` skips it. So a
+namespace created by an earlier *partial* import keeps its partial contents forever and
+no error is raised. This is the one failure mode here that is invisible by default,
+which is why `verify` compares live counts against staged parquet row counts rather than
+just printing what the index holds. Recovery is `drop-namespace` then re-import that
+year.
+
 ## Environment Setup
 
 ```bash

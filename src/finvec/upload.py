@@ -124,3 +124,64 @@ def staged_namespaces(staging_dir: Path, dataset: str) -> list[str]:
         for path in root.glob("import-*/*/*.parquet")
     }
     return sorted(found)
+
+
+def prune_uploaded(
+    staging_dir: Path,
+    dataset: str,
+    bucket: str,
+    prefix: str,
+    region: str = "us-east-1",
+    dry_run: bool = True,
+) -> tuple[int, int]:
+    """Delete local staged parts that are confirmed present in S3 at the same size.
+
+    Staging the full corpus is ~33 GB, which is a lot of disk to hold once the bytes
+    are safely in the bucket. Each file is verified individually with `head_object`
+    before it is removed — a file missing from S3, or present at a different size, is
+    kept. Returns (deleted, kept).
+    """
+    s3 = boto3.client("s3", region_name=region)
+    deleted = kept = freed = 0
+
+    for path in staged_files(staging_dir, dataset):
+        key = s3_key(prefix, _relative_key(staging_dir, dataset, path))
+        size = path.stat().st_size
+        try:
+            head = s3.head_object(Bucket=bucket, Key=key)
+        except ClientError:
+            kept += 1
+            continue
+        if head["ContentLength"] != size:
+            kept += 1
+            continue
+        freed += size
+        deleted += 1
+        if not dry_run:
+            path.unlink()
+
+    verb = "would free" if dry_run else "freed"
+    print(
+        f"{verb} {freed / 1e9:.2f} GB across {deleted:,} verified files"
+        + (f"; kept {kept:,} not confirmed in S3" if kept else ""),
+        flush=True,
+    )
+    return deleted, kept
+
+
+def expected_counts(staging_dir: Path, dataset: str) -> dict[str, int]:
+    """Records staged per namespace, from parquet footers only.
+
+    Reads row counts out of each file's metadata rather than the data itself, so this
+    is fast even across 33 GB. This is the denominator `verify` needs: without it,
+    "namespace 2024 has 180,000 records" is unfalsifiable.
+    """
+    import pyarrow.parquet as pq
+
+    counts: dict[str, int] = {}
+    for path in staged_files(staging_dir, dataset):
+        namespace = path.parent.name
+        counts[namespace] = counts.get(namespace, 0) + pq.ParquetFile(
+            path
+        ).metadata.num_rows
+    return counts
