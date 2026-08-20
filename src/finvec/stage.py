@@ -113,27 +113,42 @@ def stage_shard(
         validate_metadata(record.metadata, record.id)
         by_namespace.setdefault(record.namespace, []).append(record)
 
+    # Embed the whole shard in ONE call, then split by namespace.
+    #
+    # Embedding per namespace looks tidier but throttles itself: a shard averages ~4,000
+    # records across ~9 fiscal years, so a per-namespace call sees ~445 records — two
+    # batches — and only ever puts two requests in flight no matter what --concurrency
+    # says. One shard-wide call yields ~16 batches and actually uses the pool.
+    ordered: list[Record] = [r for ns in sorted(by_namespace) for r in by_namespace[ns]]
+    vectors = embedder.embed([(r.text, r.token_count) for r in ordered])
+    if len(vectors) != len(ordered):
+        raise RuntimeError(
+            f"shard {shard}: {len(vectors)} vectors for {len(ordered)} records"
+        )
+    if any(len(v) != EMBED_DIMS for v in vectors):
+        raise RuntimeError(
+            f"shard {shard}: embedder returned a vector of the wrong width"
+        )
+
     counts: dict[str, int] = {}
-    for namespace, records in sorted(by_namespace.items()):
+    cursor = 0
+    for namespace in sorted(by_namespace):
+        records = by_namespace[namespace]
+        # Slicing rather than re-zipping: `ordered` was built in this same namespace
+        # order, so the slice keeps each vector with the record it came from.
+        namespace_vectors = vectors[cursor : cursor + len(records)]
+        cursor += len(records)
+
         # IDs must be unique within a namespace or Pinecone silently overwrites.
         guard = UniquenessGuard(namespace)
         for record in records:
             guard.add(record.id)
         guard.raise_if_collisions()
 
-        vectors = embedder.embed([(r.text, r.token_count) for r in records])
-        if len(vectors) != len(records):
-            raise RuntimeError(
-                f"shard {shard} namespace {namespace}: {len(vectors)} vectors for "
-                f"{len(records)} records"
-            )
-        if any(len(v) != EMBED_DIMS for v in vectors):
-            raise RuntimeError(
-                f"shard {shard}: embedder returned a vector of the wrong width"
-            )
-
         directory = staging_namespace_dir(staging_dir, dataset, namespace)
-        _write_part(directory / SHARD_PART.format(shard=shard), records, vectors)
+        _write_part(
+            directory / SHARD_PART.format(shard=shard), records, namespace_vectors
+        )
         counts[namespace] = len(records)
 
     return counts

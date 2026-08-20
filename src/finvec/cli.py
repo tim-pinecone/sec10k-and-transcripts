@@ -16,7 +16,8 @@ import typer
 
 from . import profile as profile_mod
 from . import compact as compact_mod
-from . import fts, import_run, jsonl as jsonl_mod, s3_setup, stage as stage_mod
+from . import fts, import_run, jsonl as jsonl_mod, s3_setup
+from . import search as search_mod, stage as stage_mod
 from . import upload as upload_mod
 from .config import SEC_INDEX, TRANSCRIPTS_INDEX, settings
 
@@ -511,20 +512,84 @@ def verify(
 
 @app.command()
 def search(
-    query: str = typer.Argument(..., help="Natural-language query."),
+    query: str = typer.Argument(..., help="Natural-language or keyword query."),
     dataset: str = typer.Option("sec", help="'sec' or 'transcripts'."),
-    year: Optional[int] = typer.Option(None, help="Single year namespace."),
-    years: Optional[str] = typer.Option(None, help="Year range, e.g. '2021-2024'."),
-    ticker: Optional[str] = typer.Option(None, help="Filter by ticker."),
+    mode: str = typer.Option(
+        "hybrid", help="'text' (BM25), 'dense' (semantic), or 'hybrid'."
+    ),
+    years: Optional[str] = typer.Option(
+        None, help="Year namespaces: '2024', '2021-2024', '2019,2021-2023'."
+    ),
+    ticker: Optional[str] = typer.Option(None, help="Filter to one ticker."),
+    must_contain: Optional[str] = typer.Option(
+        None, help="Hard lexical requirement ($match_all). Defaults to the query in hybrid mode."
+    ),
     include_boilerplate: bool = typer.Option(
-        False, help="SEC only: include LSH-flagged boilerplate chunks."
+        False, help="Include LSH-flagged boilerplate chunks."
+    ),
+    merge: Optional[str] = typer.Option(
+        None, help="'score', 'rrf', or 'rerank'. Default depends on mode."
     ),
     top_k: int = typer.Option(10),
 ) -> None:
-    """Query one year, or fan out across a year range via query_namespaces."""
+    """Search one year namespace, or fan out across several and merge.
+
+    The FTS API takes one namespace per request and has no `query_namespaces`, so
+    multi-year search fans out client-side. How the results merge matters: cosine scores
+    are comparable across namespaces, BM25 scores are not, so `text` mode defaults to a
+    rank-based merge instead of a score sort. `--merge rerank` orders the union with a
+    cross-encoder, which sidesteps comparability entirely.
+    """
     _require_dataset(dataset)
-    typer.secho("`search` is not implemented yet.", fg=typer.colors.YELLOW)
-    raise typer.Exit(1)
+    if mode not in ("text", "dense", "hybrid"):
+        raise typer.BadParameter("mode must be 'text', 'dense', or 'hybrid'")
+    if merge is not None and merge not in ("score", "rrf", "rerank"):
+        raise typer.BadParameter("merge must be 'score', 'rrf', or 'rerank'")
+
+    namespaces = search_mod.year_namespaces(years, default=[])
+    if not namespaces:
+        namespaces = upload_mod.staged_namespaces(settings().staging_dir, dataset)
+    if not namespaces:
+        raise typer.BadParameter(
+            "no year namespaces given and none inferable from staging; pass --years"
+        )
+
+    pc = fts.client()
+    idx = pc.preview.index(name=DATASETS[dataset])
+    hits, strategy = search_mod.search(
+        pc, idx, query, namespaces,
+        mode=mode, top_k=top_k, must_contain=must_contain,
+        ticker=ticker, include_boilerplate=include_boilerplate,
+        merge=merge,  # type: ignore[arg-type]
+    )
+
+    typer.echo(
+        f"\n{mode} over {len(namespaces)} namespace(s) "
+        f"[{namespaces[0]}..{namespaces[-1]}] · merged by {strategy} · "
+        f"{len(hits)} result(s)\n"
+    )
+    if strategy == "rrf":
+        typer.secho(
+            "  note: BM25 scores are not comparable across namespaces, so results are "
+            "interleaved by rank. Use --merge rerank for a single global ordering.",
+            fg=typer.colors.YELLOW,
+        )
+        typer.echo("")
+    for i, hit in enumerate(hits, start=1):
+        f = hit.fields
+        label = f.get("ticker", "?")
+        when = f.get("call_date") or f.get("fiscal_year")
+        extra = f" Q{int(f['quarter'])}" if f.get("quarter") else ""
+        speaker = f" · {f['speaker']}" if f.get("speaker") else ""
+        flags = " · table" if f.get("is_table") else ""
+        flags += " · boilerplate" if f.get("is_boilerplate") else ""
+        typer.secho(
+            f"{i:>3}. {label} {when}{extra}{speaker}  "
+            f"[{hit.ordering_score:.4f}] ns={hit.namespace} rank={hit.rank}{flags}",
+            fg=typer.colors.CYAN,
+        )
+        text = hit.text.replace("\n", " ")
+        typer.echo(f"     {text[:240]}{'…' if len(text) > 240 else ''}\n")
 
 
 def main() -> None:

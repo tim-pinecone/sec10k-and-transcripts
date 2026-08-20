@@ -75,3 +75,71 @@ def test_progress_resumes_the_denominator_not_just_the_counter(tmp_path):
     assert payload["done"] == 401
     assert payload["resumed_from"] == 400
     assert 29 < payload["pct"] < 30
+
+
+def test_stage_shard_embeds_the_whole_shard_in_one_call(tmp_path, monkeypatch):
+    """Per-namespace embedding silently caps concurrency at ~2 batches.
+
+    A shard spans ~9 fiscal years, so embedding per namespace sees only a few hundred
+    records at a time and never fills the request pool no matter what --concurrency is
+    set to. This asserts one shard-wide call, and that vectors stay aligned with the
+    records they belong to after the split back out by namespace.
+    """
+    import json
+
+    import pyarrow.parquet as pq
+
+    from finvec import stage as stage_mod
+    from finvec.sources.base import Record
+
+    def fake_shard(shard):
+        for year in (2023, 2024):
+            for chunk in range(3):
+                text = f"{year}-{chunk} " * 20
+                yield Record(
+                    id=f"AAA_{year}_10K_CHUNK_{chunk}",
+                    namespace=str(year),
+                    text=text,
+                    metadata={
+                        "ticker": "AAA", "cik": "1", "fiscal_year": year,
+                        "sic": "1", "sic_description": "x", "chunk_id": chunk,
+                        "is_table": False, "is_boilerplate": False,
+                        "token_count": len(text), "text": text,
+                    },
+                    token_count=len(text),
+                )
+
+    monkeypatch.setattr(stage_mod.sec10k, "iter_shard", fake_shard)
+
+    class CountingEmbedder:
+        def __init__(self):
+            self.calls = 0
+            self.seen = []
+
+        def embed(self, items):
+            self.calls += 1
+            self.seen.append(len(items))
+            # Encode the input index into the vector so alignment is checkable.
+            return [[float(i)] * stage_mod.EMBED_DIMS for i in range(len(items))]
+
+    embedder = CountingEmbedder()
+    counts = stage_shard_counts = stage_mod.stage_shard(
+        7, tmp_path, embedder, dataset="sec"
+    )
+
+    assert embedder.calls == 1, f"expected one embed call, got {embedder.calls}"
+    assert sum(stage_shard_counts.values()) == embedder.seen[0]
+
+    # Alignment: the vector written for each record must be the one generated for its
+    # position in the single shard-wide call.
+    position = 0
+    for namespace in sorted(counts):
+        part = next((tmp_path / "sec" / f"import-{namespace}" / namespace).glob("*.parquet"))
+        table = pq.read_table(part)
+        for value in table["values"].to_pylist():
+            assert value[0] == float(position), (
+                f"vector/record misalignment at position {position}"
+            )
+            position += 1
+        for meta in table["metadata"].to_pylist():
+            assert json.loads(meta)["fiscal_year"] == int(namespace)
