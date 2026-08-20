@@ -14,6 +14,7 @@ from typing import Iterator, Sequence
 
 from openai import APIError, APITimeoutError, RateLimitError
 from tenacity import (
+    RetryCallState,
     retry,
     retry_if_exception_type,
     stop_after_attempt,
@@ -30,6 +31,22 @@ MAX_TOKENS_PER_REQUEST = 80_000
 # truncated — so it must be caught before a request goes out, not discovered halfway
 # through a multi-hour job.
 MAX_TOKENS_PER_INPUT = 8191
+
+
+def _log_retry(state: RetryCallState) -> None:
+    """Announce every backoff.
+
+    A silent retry loop is indistinguishable from a hang, and rate-limit backoff is
+    exactly when a long embedding run looks frozen. This also tells you whether raising
+    concurrency would help or just generate more 429s.
+    """
+    exc = state.outcome.exception() if state.outcome else None
+    print(
+        f"  embed retry {state.attempt_number} after "
+        f"{state.seconds_since_start:.0f}s: {type(exc).__name__}: "
+        f"{str(exc)[:120]}",
+        flush=True,
+    )
 
 
 @dataclass
@@ -87,11 +104,13 @@ class Embedder:
         self.dims = dims
         self.concurrency = concurrency
         self.tokens_embedded = 0
+        self.retries = 0
 
     @retry(
         retry=retry_if_exception_type((RateLimitError, APITimeoutError, APIError)),
         wait=wait_random_exponential(multiplier=2, max=120),
         stop=stop_after_attempt(8),
+        before_sleep=_log_retry,
         reraise=True,
     )
     def _embed_once(self, texts: list[str]) -> list[list[float]]:
