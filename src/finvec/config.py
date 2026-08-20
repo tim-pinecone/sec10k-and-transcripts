@@ -65,19 +65,28 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     pinecone_api_key: str = ""
+    # Not needed while the staging bucket is public: Pinecone's docs state an
+    # Integration ID isn't required to import from a public bucket. Kept for the
+    # private-bucket fallback, which also needs an IAM role trusting account
+    # 713131977538.
     pinecone_storage_integration_id: str = ""
     openai_api_key: str = ""
 
     aws_region: str = "us-east-1"
+    # The index region should match the bucket region: S3 to an AWS service in the
+    # same region transfers free, so a mismatch adds cross-region egress to every
+    # import for no benefit.
+    pinecone_region: str = ""
     s3_bucket: str = ""
     s3_prefix: str = "sec10k-and-transcripts"
 
     staging_dir: Path = Field(default=Path("staging"))
     state_dir: Path = Field(default=Path("data/state"))
 
-    def s3_uri(self, dataset: str) -> str:
-        """Import URI prefix. Must name the *parent* of the namespace directories."""
-        return f"s3://{self.s3_bucket}/{self.s3_prefix}/{dataset}"
+    @property
+    def index_region(self) -> str:
+        """Index region, defaulting to the bucket's so transfer stays free."""
+        return self.pinecone_region or self.aws_region
 
     def require(self, *names: str) -> None:
         """Fail loudly and early, before a long job starts, not midway through."""

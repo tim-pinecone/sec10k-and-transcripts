@@ -50,6 +50,42 @@ You need:
 `uv run finvec profile` measures the corpus and prints a cost projection **without
 spending anything**. Run it first.
 
+## Load this corpus into your own Pinecone index
+
+The staged embeddings live in a **public, read-only S3 bucket**, and Pinecone doesn't
+require a storage integration to import from a public bucket. So you need no AWS
+account, no IAM role, and no console setup — just an index of the right shape and one
+call per year:
+
+```python
+from pinecone import Pinecone, ServerlessSpec, ImportErrorMode
+
+pc = Pinecone(api_key="...")
+pc.create_index(
+    name="sec-10k-index",
+    dimension=1536,
+    metric="dotproduct",
+    spec=ServerlessSpec(cloud="aws", region="us-east-1"),  # must be AWS
+)
+index = pc.Index(host=pc.describe_index("sec-10k-index").host)
+
+for year in range(2004, 2026):
+    index.start_import(
+        uri=f"s3://{BUCKET}/{PREFIX}/sec/import-{year}/",  # note: import-{year}/
+        error_mode=ImportErrorMode.CONTINUE,
+        # no integration_id — the bucket is public
+    )
+```
+
+Each year is a separate import into its own namespace, so a failure costs you one year
+rather than the whole corpus. Point `uri` at `.../sec/` instead of `.../sec/import-2004/`
+and you'll get 22 namespaces named `import-2004`…`import-2025` — the extra path level
+is what makes per-year retries possible.
+
+Requirements on your side: an **AWS-hosted** index (S3 imports can't reach GCP or Azure
+indexes), and a **Standard** plan, since imports are Standard/Enterprise only and the
+corpus is far past Builder's 10 GB storage cap.
+
 ## Setup
 
 **Requirements:** Python 3.12+, [uv](https://docs.astral.sh/uv/)
@@ -72,13 +108,13 @@ same command to pick up where it left off.
 
 ```bash
 uv run finvec profile                    # measure corpus + project cost (free)
-uv run finvec stage sec                  # embed → staging/{year}/*.parquet
-uv run finvec stage transcripts
-uv run finvec upload                     # staging → s3://$S3_BUCKET/$S3_PREFIX
-uv run finvec import sec                 # start_import per year namespace, then poll
-uv run finvec verify                     # per-namespace counts vs. expected
+uv run finvec stage sec                  # merge + embed → staging/sec/import-{year}/{year}/
+uv run finvec s3-setup                   # dry run; --apply to create the public bucket
+uv run finvec upload sec                 # staging → s3://$S3_BUCKET/$S3_PREFIX
+uv run finvec import sec                 # one import per year namespace, polled together
+uv run finvec verify sec                 # per-namespace record counts
+uv run finvec drop-namespace sec 2024    # required before re-importing a year
 uv run finvec search "supply chain risk" --year 2024 --ticker NVDA
-uv run finvec search "AI capex" --years 2021-2024 --index transcripts
 ```
 
 Progress is flushed live and mirrored to a `status.json` you can `tail` from another

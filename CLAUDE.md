@@ -71,6 +71,61 @@ Merged-record metadata:
 - `is_boilerplate`, `is_table` — unchanged booleans, identical across the run by
   construction.
 
+### S3 staging bucket (public, read-only)
+
+The bucket is **public** for one concrete reason: Pinecone's docs state that *"an
+Integration ID isn't needed to import from a public bucket."* Public read therefore
+deletes the entire AWS prerequisite chain — IAM policy, a role trusting Pinecone's
+account `713131977538`, and a per-project storage integration — for us and for every
+other person who wants this corpus. They call `start_import(uri=...)` and nothing else.
+
+The policy grants `s3:GetObject`, `s3:ListBucket`, and `s3:GetBucketLocation`. **No
+write actions of any kind.** `BlockPublicAcls` and `IgnorePublicAcls` stay ON, so the
+one bucket policy is the only route to public access — an object ACL cannot expose
+anything even by mistake. `tests/test_s3_setup.py` asserts the policy grants no
+`s3:Put*` or `s3:Delete*`.
+
+Nothing in the bucket is confidential — it is embeddings derived from public SEC
+filings and public HF datasets — so the exposure is billing, not secrecy. Egress is
+paid by the bucket owner. Keep the bucket in the **same region as the index**: S3 to an
+AWS service in the same region transfers free, so the import path costs no egress.
+Anonymous internet downloads bill at the normal rate, ~$3 per full copy of the merged
+corpus. `PINECONE_REGION` defaults to `AWS_REGION` to keep these aligned.
+
+Created with boto3 via `finvec s3-setup` (dry run by default; `--apply` to execute).
+
+### Per-year import layout
+
+Two Pinecone rules decide the whole directory scheme:
+
+- `start_import` reads namespace names from the **immediate subdirectories** of `uri`.
+- A namespace that already exists **cannot** be imported into.
+
+The obvious layout (`{dataset}/{year}/`, one import at `{dataset}/`) creates all 22
+namespaces in one call — and works exactly once. A partway failure leaves some
+namespaces created, and retrying the same prefix then fails on those, so recovery means
+deleting every created namespace and re-importing everything. Instead each year gets an
+isolated import root:
+
+```
+{prefix}/{dataset}/import-2004/2004/part-00000.parquet
+{prefix}/{dataset}/import-2005/2005/part-00000.parquet
+
+start_import(uri="s3://{bucket}/{prefix}/{dataset}/import-2004/")  ->  namespace "2004"
+```
+
+One import per year, started concurrently and polled together. A failed year is
+dropped and redone alone; the other 21 are untouched. Data is stored once — the extra
+path level costs nothing.
+
+The hazard this creates is pointing `uri` one level too high, at `{dataset}/`, which
+would create 22 namespaces named `import-2004` … `import-2025`. Every call path goes
+through `layout.assert_import_uri`, and `tests/test_layout.py` covers both the
+too-high and too-low mistakes.
+
+Retry path, since it is not optional: `finvec drop-namespace {dataset} {year}` then
+`finvec import {dataset} --namespaces {year}`.
+
 ### Deterministic IDs
 
 - SEC: `{TICKER}_{FISCAL_YEAR}_10K_CHUNK_{CHUNK_ID}`
