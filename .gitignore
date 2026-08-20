@@ -1,0 +1,166 @@
+# ── Secrets ──────────────────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+secrets.json
+secrets.yaml
+secrets.yml
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+*.whl
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ── uv ───────────────────────────────────────────────────────────────────────
+# uv.lock should be committed for applications (remove this line if a library)
+# .uv/  <- uv's internal cache, not typically in project dir
+
+# ── Virtual Environments ─────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.env/
+virtualenv/
+
+# ── Testing ──────────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+nosetests.xml
+test-results/
+junit.xml
+
+# ── Type Checking ─────────────────────────────────────────────────────────────
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+.pyre/
+
+# ── Linting / Formatting ─────────────────────────────────────────────────────
+.ruff_cache/
+
+# ── Jupyter ──────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# ── Distribution / Packaging ─────────────────────────────────────────────────
+MANIFEST
+*.tar.gz
+*.zip
+*.whl
+*.egg-link
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+lib/python*/site-packages/
+lib64/
+
+# ── macOS ────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.TemporaryItems
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# ── IDEs — VS Code ───────────────────────────────────────────────────────────
+.vscode/
+*.code-workspace
+.history/
+
+# ── IDEs — JetBrains ─────────────────────────────────────────────────────────
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+.idea_modules/
+
+# ── IDEs — Vim / Neovim ──────────────────────────────────────────────────────
+*.swp
+*.swo
+*~
+.netrwhist
+tags
+
+# ── IDEs — Emacs ─────────────────────────────────────────────────────────────
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+.\#*
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+log/
+npm-debug.log*
+
+# ── Databases ────────────────────────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ── OS — Windows ─────────────────────────────────────────────────────────────
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ── Misc ─────────────────────────────────────────────────────────────────────
+.cache/
+.temp/
+tmp/
+temp/
+*.bak
+*.tmp
+*.orig
+
+# ── Project: staged artifacts (tens of GB — never commit) ────────────────────
+data/
+staging/
+hf_cache/
+*.parquet
+*.jsonl
+*.jsonl.gz
+status.json
+_checkpoint*.json
