@@ -36,8 +36,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 mkdir -p logs data/state
-LOG="logs/run-$(date +%Y%m%d-%H%M%S).log"
-ln -sf "$(basename "$LOG")" logs/latest.log
+# A detached child inherits the parent's log path. Letting it pick its own would
+# create a second file whenever the two starts land in different seconds.
+if [[ -n "${FINVEC_LOG:-}" ]]; then
+  LOG="$FINVEC_LOG"
+else
+  LOG="logs/run-$(date +%Y%m%d-%H%M%S).log"
+  ln -sf "$(basename "$LOG")" logs/latest.log
+fi
 
 # ── Detach ───────────────────────────────────────────────────────────────────
 # Re-exec under nohup so the run survives the terminal closing. Requires --yes,
@@ -50,14 +56,48 @@ if [[ $DETACH -eq 1 ]]; then
   args=(--yes --concurrency "$CONCURRENCY" --stages "$STAGES")
   [[ -n "$SHARDS" ]] && args+=(--shards "$SHARDS")
   [[ $PRUNE -eq 1 ]] && args+=(--prune)
-  nohup "$0" "${args[@]}" >>"$LOG" 2>&1 &
+  FINVEC_LOG="$LOG" FINVEC_DETACHED=1 nohup "$0" "${args[@]}" >>"$LOG" 2>&1 &
   echo "started in background · pid $!"
   echo "  log:     tail -f logs/latest.log"
   echo "  monitor: ./watch.sh"
   exit 0
 fi
 
-exec > >(tee -a "$LOG") 2>&1
+# When detached, nohup already points stdout at the log; teeing as well would write
+# every line twice. In the foreground, tee is what puts output on the terminal *and*
+# in the log.
+if [[ -z "${FINVEC_DETACHED:-}" ]]; then
+  exec > >(tee -a "$LOG") 2>&1
+fi
+
+# ── Single-runner lock ───────────────────────────────────────────────────────
+# Re-running this script does NOT stop an existing run. Two concurrent stagers
+# would share one checkpoint file, each holding its own in-memory copy and
+# overwriting the other's writes — so completed shards get forgotten and re-embedded
+# at full OpenAI cost. mkdir is atomic on every filesystem we care about, which makes
+# it a usable lock primitive.
+LOCK="data/state/run.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  owner=$(cat "$LOCK/pid" 2>/dev/null || echo "unknown")
+  if [[ "$owner" != "unknown" ]] && kill -0 "$owner" 2>/dev/null; then
+    cat >&2 <<MSG
+Another run is already active (pid $owner).
+
+Re-running this script does not stop it — you would get two stagers sharing one
+checkpoint and paying twice for the same embeddings.
+
+  watch it:  ./watch.sh
+  stop it:   kill $owner
+  then re-run this command; staging resumes from the checkpoint.
+MSG
+    exit 1
+  fi
+  echo "clearing stale lock from pid $owner (no longer running)"
+  rm -rf "$LOCK"
+  mkdir "$LOCK"
+fi
+echo $$ > "$LOCK/pid"
+trap 'rm -rf "$LOCK"' EXIT
 
 say()  { printf '\n\033[1m== %s\033[0m  %s\n' "$1" "$(date +%H:%M:%S)"; }
 note() { printf '   %s\n' "$1"; }
