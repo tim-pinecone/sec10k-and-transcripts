@@ -261,3 +261,19 @@ is asserted in `tests/test_limits.py` so it cannot drift.
 
 The full build is **~$49 one-time**, not the ~$139 projected in §7. Still needs a
 Standard plan: 92 GB (or 33 GB merged) is far past Builder's 10 GB cap.
+
+---
+
+## 9. Decisions taken
+
+| Question | Decision |
+|---|---|
+| Ingest path | **Bulk import from S3** — 16× cheaper than upsert; accepts the nonexistent-namespace constraint |
+| Embedding | **OpenAI `text-embedding-3-small` @ 1536 dims** |
+| Metric | **`dotproduct`** — identical to cosine on normalized vectors, but keeps hybrid open |
+| Chunking | **Merge consecutive same-flag chunks** (~3.3 each → ~314 tokens), preserving exact boolean filters |
+| Default scope | **Full corpus** — no demo-subset default; shard ranges exist for smoke runs |
+| Repo | Public, `tim-pinecone/sec10k-and-transcripts`, Apache-2.0 |
+
+Expected: **~$34 one-time** (embeddings + import), **~$61/mo** (storage + Standard plan
+minimum).

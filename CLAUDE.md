@@ -45,6 +45,32 @@ profile → stage (embed → parquet) → upload (S3) → import (per namespace)
 - Filterable metadata ≤ 40 KB/record; IDs ≤ 512 chars. Our records are ~2 KB and
   ~26 chars, so both are comfortable.
 
+### Chunk merging (decided)
+
+The source's chunks are ~95 real tokens / ~380 bytes each — too thin for financial
+retrieval, and wasteful, because the fixed 6,144-byte vector gets paid once per
+sentence-sized fragment. Before embedding, **merge consecutive chunks that share the
+same `(ticker, fiscal_year, is_boilerplate, is_table)` key**, in `chunk_id` order.
+
+Merging within same-flag runs — which average 3.3 chunks — keeps `is_boilerplate` and
+`is_table` exactly boolean, so query filters mean what the schema says they mean. No
+`boilerplate_frac` thresholds.
+
+Result: 4.1M records at ~314 tokens, 33.4 GB, ~$8 import, ~$11/mo storage. Embedding
+cost is unchanged because it is the same text.
+
+Merged-record metadata:
+
+- `chunk_id` — the **first** source `chunk_id` in the run (keeps IDs deterministic and
+  ordering meaningful).
+- `source_chunk_ids` — list of strings, the fragments merged in.
+- `char_count` — sum of the source `token_count` column. **Never name this field
+  `token_count`:** the source column is a character count, and propagating that name
+  would mislead anyone who filters on it later.
+- `token_count` — real `cl100k_base` count of the merged text, computed by us.
+- `is_boilerplate`, `is_table` — unchanged booleans, identical across the run by
+  construction.
+
 ### Deterministic IDs
 
 - SEC: `{TICKER}_{FISCAL_YEAR}_10K_CHUNK_{CHUNK_ID}`
