@@ -8,6 +8,7 @@ its own, and the expensive stages sit behind the free `profile` gate.
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 from typing import Optional
@@ -138,10 +139,24 @@ def probe_schema(
     _require_dataset(dataset)
     s = settings()
     parts = upload_mod.staged_files(s.staging_dir, dataset)
+    marker = _state_dir() / f"probe-{dataset}.json"
     if not parts:
+        # Staging may legitimately be gone: prune deletes it once the bytes are in S3.
+        # Skipping is only honest if the contract was actually validated before, so it
+        # is gated on the marker rather than assumed.
+        if marker.exists():
+            info = json.loads(marker.read_text())
+            typer.secho(
+                f"skipped: nothing staged locally to probe, and the schema contract "
+                f"was already validated at {info.get('validated_at', 'an earlier run')}"
+                f" ({info.get('documents', '?')} documents).",
+                fg=typer.colors.YELLOW,
+            )
+            return
         typer.secho(
-            f"nothing staged under {s.staging_dir}/{dataset} — run "
-            f"`finvec stage {dataset}` first (a single shard is enough).",
+            f"nothing staged under {s.staging_dir}/{dataset} and no previous "
+            f"validation on record — run `finvec stage {dataset}` first (a single "
+            f"shard is enough).",
             fg=typer.colors.YELLOW,
         )
         raise typer.Exit(1)
@@ -257,6 +272,15 @@ def probe_schema(
     if failures:
         typer.secho(f"{failures} check(s) failed", fg=typer.colors.RED)
         raise typer.Exit(1)
+    # Recorded so a later run whose staging has been pruned can honestly skip this
+    # gate instead of failing on it.
+    marker.write_text(
+        json.dumps(
+            {"dataset": dataset, "documents": len(docs),
+             "index": DATASETS[dataset], "validated_at": time.strftime("%Y-%m-%d %H:%M:%S")},
+            indent=1,
+        )
+    )
     typer.secho("schema and document contract validated", fg=typer.colors.GREEN)
 
 
