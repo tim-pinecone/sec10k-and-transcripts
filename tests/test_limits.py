@@ -69,3 +69,34 @@ def test_empty_input_is_rejected_before_a_request_goes_out():
 
     with pytest.raises(ValueError, match="empty or whitespace-only"):
         list(batch_texts([("real", 10), ("   ", 1)]))
+
+
+def test_only_transient_errors_are_retried():
+    """A deterministic 400 must fail immediately, not after 8 backoffs.
+
+    `APIError` is the base class of `BadRequestError`, so retrying on `APIError` meant
+    an empty-input 400 was retried with exponential backoff — ~10 minutes of pointless
+    waiting per doomed batch, and 56 retry lines burying the real cause.
+    """
+    from openai import (
+        APIConnectionError,
+        APITimeoutError,
+        BadRequestError,
+        InternalServerError,
+        RateLimitError,
+    )
+
+    from finvec.embed import Embedder
+
+    predicate = Embedder._embed_once.retry.retry
+    retried = predicate.exception_types
+
+    assert RateLimitError in retried
+    assert APITimeoutError in retried
+    assert APIConnectionError in retried
+    assert InternalServerError in retried
+    # The ones that must NOT be retried, because retrying cannot change the outcome.
+    assert BadRequestError not in retried
+    assert not any(issubclass(BadRequestError, t) for t in retried), (
+        "BadRequestError is reachable through a retried base class"
+    )

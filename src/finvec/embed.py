@@ -12,7 +12,12 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Iterator, Sequence
 
-from openai import APIError, APITimeoutError, RateLimitError
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+    RateLimitError,
+)
 from tenacity import (
     RetryCallState,
     retry,
@@ -115,8 +120,15 @@ class Embedder:
         self.tokens_embedded = 0
         self.retries = 0
 
+    # Only transient failures are retried. `APIError` was too broad: BadRequestError
+    # subclasses it, so a deterministic 400 — an empty input, a malformed request — was
+    # retried 8 times with exponential backoff before failing. That burned ~10 minutes
+    # per doomed batch and buried the real cause under a wall of retry noise.
+    # Deterministic 4xx must fail immediately; only 429/timeout/connection/5xx retry.
     @retry(
-        retry=retry_if_exception_type((RateLimitError, APITimeoutError, APIError)),
+        retry=retry_if_exception_type(
+            (RateLimitError, APITimeoutError, APIConnectionError, InternalServerError)
+        ),
         wait=wait_random_exponential(multiplier=2, max=120),
         stop=stop_after_attempt(8),
         before_sleep=_log_retry,
