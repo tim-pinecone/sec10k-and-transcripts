@@ -497,6 +497,45 @@ def import_cmd(
         raise typer.Exit(1)
 
 
+@app.command("import-status")
+def import_status(
+    dataset: str = typer.Argument("sec", help="'sec' or 'transcripts'."),
+) -> None:
+    """List every import on the index, straight from Pinecone.
+
+    Reads the server's own import records rather than a local status file, so it works
+    while a run is polling, after one has exited, and regardless of what any local
+    state says.
+    """
+    _require_dataset(dataset)
+    api = fts.ImportClient(_index_host(dataset))
+    rows = list(api.list())
+    if not rows:
+        typer.echo("no imports on this index")
+        return
+
+    by_status: dict[str, int] = {}
+    total = 0
+    typer.echo(f"  {'id':>4}  {'status':<12}{'pct':>7}{'records':>14}  uri")
+    for row in sorted(rows, key=lambda r: int(r.id) if r.id.isdigit() else 0):
+        by_status[row.status] = by_status.get(row.status, 0) + 1
+        total += row.records_imported
+        colour = (
+            typer.colors.GREEN if row.status == "Completed"
+            else typer.colors.RED if row.status in ("Failed", "Cancelled")
+            else typer.colors.CYAN
+        )
+        tail = row.error or ""
+        typer.secho(
+            f"  {row.id:>4}  {row.status:<12}{row.percent_complete:>6.0f}%"
+            f"{row.records_imported:>14,}  {tail[:60]}",
+            fg=colour,
+        )
+    typer.echo("")
+    typer.echo("  " + " · ".join(f"{k}: {v}" for k, v in sorted(by_status.items())))
+    typer.echo(f"  {total:,} documents imported so far")
+
+
 @app.command("drop-namespace")
 def drop_namespace_cmd(
     dataset: str = typer.Argument(..., help="'sec' or 'transcripts'."),
@@ -562,7 +601,28 @@ def verify(
         )
         expected = {}
 
-    rows, problems = import_run.reconcile(expected, _state_dir())
+    # Pinecone's own import records are the authoritative account of what landed, and
+    # they do not depend on a local checkpoint surviving.
+    try:
+        api = fts.ImportClient(_index_host(dataset))
+        actual = import_run.imported_by_namespace(api)
+        source = "pinecone import records"
+    except Exception as exc:  # noqa: BLE001 - fall back rather than fail the check
+        typer.secho(f"  could not read imports from Pinecone ({exc}); "
+                    f"falling back to the local checkpoint", fg=typer.colors.YELLOW)
+        actual, source = {}, "local checkpoint"
+
+    if actual:
+        namespaces = sorted(set(expected) | set(actual))
+        rows = {
+            ns: (expected.get(ns, -1), actual.get(ns, 0)) for ns in namespaces
+        }
+        problems = [
+            ns for ns, (w, g) in rows.items() if w >= 0 and w != g
+        ]
+    else:
+        rows, problems = import_run.reconcile(expected, _state_dir())
+    typer.echo(f"  imported counts from: {source}")
     total_want = (
         sum(expected.values()) if expected
         else import_run.expected_total_from_stage(_state_dir(), dataset)

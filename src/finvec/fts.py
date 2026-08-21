@@ -121,6 +121,10 @@ TERMINAL_BAD = {"Failed", "Cancelled"}
 class ImportStatus:
     id: str
     status: str
+    # Carried because it is the only link back to the namespace an import targeted:
+    # document-schema indexes have no describe_index_stats, so the URI is how imported
+    # counts get attributed to a year.
+    uri: str = ""
     percent_complete: float = 0.0
     records_imported: int = 0
     error: str | None = None
@@ -187,6 +191,7 @@ class ImportClient:
         return ImportStatus(
             id=str(body.get("id", import_id)),
             status=body.get("status", "Unknown"),
+            uri=body.get("uri") or "",
             percent_complete=float(body.get("percentComplete") or 0.0),
             records_imported=int(body.get("recordsImported") or 0),
             error=body.get("error"),
@@ -203,6 +208,7 @@ class ImportClient:
                 yield ImportStatus(
                     id=str(item.get("id")),
                     status=item.get("status", "Unknown"),
+                    uri=item.get("uri") or "",
                     percent_complete=float(item.get("percentComplete") or 0.0),
                     records_imported=int(item.get("recordsImported") or 0),
                     error=item.get("error"),

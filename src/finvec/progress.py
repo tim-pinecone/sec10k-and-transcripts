@@ -78,6 +78,16 @@ class Checkpoint:
     def __len__(self) -> int:
         return len(self._done)
 
+    def __bool__(self) -> bool:
+        """Always truthy.
+
+        Without this, `__len__` makes an empty checkpoint falsy — so a guard like
+        `if checkpoint: checkpoint.mark(...)` silently never fires, and can never start
+        firing, because the write is gated on the emptiness it would resolve. That cost
+        a completed 20-namespace import its entire record.
+        """
+        return True
+
     def is_done(self, key: str) -> bool:
         return key in self._done
 

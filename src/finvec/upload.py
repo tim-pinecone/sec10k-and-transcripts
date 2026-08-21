@@ -228,6 +228,12 @@ def write_manifest(
     files: dict[str, int] = {}
     for path in staged_files(staging_dir, dataset):
         files[path.parent.name] = files.get(path.parent.name, 0) + 1
+    if not counts:
+        # Staging may already be pruned. Writing an empty manifest here would clobber
+        # the real one and leave verify with no baseline at all.
+        existing = load_manifest(state_dir, dataset)
+        if existing:
+            return existing
     manifest = {
         "dataset": dataset,
         "namespaces": {

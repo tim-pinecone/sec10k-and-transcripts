@@ -40,6 +40,19 @@ class YearImport:
     def ok(self) -> bool:
         return self.status == "Completed"
 
+    @property
+    def already_existed(self) -> bool:
+        """Failed only because the namespace was already imported.
+
+        `start_import` accepts the request and returns an id, then fails the import
+        asynchronously — so this cannot be detected when starting, only when polling.
+        It means the year is already loaded, which is success for a resumed run, not a
+        failure.
+        """
+        return self.status == "Failed" and bool(
+            self.error and "already exists" in self.error
+        )
+
     def absorb(self, status: ImportStatus) -> None:
         self.status = status.status
         self.records_imported = status.records_imported
@@ -54,7 +67,11 @@ class ImportRun:
 
     @property
     def failed(self) -> list[YearImport]:
-        return [j for j in self.jobs if j.done and not j.ok]
+        return [j for j in self.jobs if j.done and not j.ok and not j.already_existed]
+
+    @property
+    def already_imported(self) -> list[YearImport]:
+        return [j for j in self.jobs if j.already_existed]
 
     @property
     def records(self) -> int:
@@ -129,7 +146,7 @@ def poll(
             if job.done or not job.import_id:
                 continue
             job.absorb(api.describe(job.import_id))
-            if job.done and checkpoint:
+            if job.done and checkpoint is not None:
                 checkpoint.mark(
                     job.namespace,
                     import_id=job.import_id,
@@ -151,8 +168,18 @@ def poll(
             break
         time.sleep(interval)
 
-    if checkpoint:
+    if checkpoint is not None:
         checkpoint.flush()
+
+    if run.already_imported:
+        print(
+            f"{len(run.already_imported)} namespace(s) were already imported and were "
+            f"rejected server-side: "
+            f"{', '.join(j.namespace for j in run.already_imported)}\n"
+            f"  that is expected on a re-run — imports cannot add to an existing "
+            f"namespace.",
+            flush=True,
+        )
 
     for job in run.failed:
         print(
@@ -199,3 +226,24 @@ def reconcile(
         if want >= 0 and imported != want:
             problems.append(namespace)
     return rows, problems
+
+
+def imported_by_namespace(api: ImportClient) -> dict[str, int]:
+    """Documents imported per namespace, read from Pinecone's own import records.
+
+    Authoritative and independent of local state: it survives a lost checkpoint, a
+    machine change, and a run that was killed mid-poll. The namespace is recovered from
+    each import's URI, which is exactly the mapping `start_import` was given.
+    """
+    from .layout import namespace_from_import_uri
+
+    totals: dict[str, int] = {}
+    for status in api.list():
+        if status.status != "Completed":
+            continue
+        try:
+            namespace = namespace_from_import_uri(status.uri)
+        except ValueError:
+            continue
+        totals[namespace] = totals.get(namespace, 0) + status.records_imported
+    return dict(sorted(totals.items()))
