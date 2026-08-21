@@ -16,7 +16,7 @@ import typer
 
 from . import profile as profile_mod
 from . import compact as compact_mod
-from . import fts, import_run, jsonl as jsonl_mod, s3_setup
+from . import fts, import_run, jsonl as jsonl_mod, preflight as preflight_mod, s3_setup
 from . import search as search_mod, stage as stage_mod
 from . import upload as upload_mod
 from .config import SEC_INDEX, TRANSCRIPTS_INDEX, settings
@@ -363,6 +363,38 @@ def prune(
             s.staging_dir, dataset, s.s3_bucket, s.s3_prefix,
             region=s.aws_region, dry_run=not apply,
         )
+
+
+@app.command("preflight-import")
+def preflight_import(
+    dataset: str = typer.Argument("sec", help="'sec' or 'transcripts'."),
+    sample: int = typer.Option(
+        400, help="Documents sampled per parquet part for field-size checks."
+    ),
+) -> None:
+    """Audit staged data against every documented import and document limit.
+
+    Reads no Pinecone state and costs nothing. Worth running before an import
+    because the recovery path on the far side is expensive: imports only create
+    namespaces that do not exist, so a rejected import leaves a partially created
+    namespace that blocks its own retry until it is dropped.
+    """
+    _require_dataset(dataset)
+    s = settings()
+    import json as _json
+
+    checkpoint = _state_dir() / f"stage-{dataset}.checkpoint.json"
+    shards_done = len(_json.loads(checkpoint.read_text())) if checkpoint.exists() else 0
+
+    measured = preflight_mod.measure(s.staging_dir, dataset, sample_docs_per_part=sample)
+    if not measured["files"]:
+        typer.secho(f"nothing staged under {s.staging_dir}/{dataset}",
+                    fg=typer.colors.YELLOW)
+        raise typer.Exit(1)
+    report = preflight_mod.audit(measured, shards_done=shards_done)
+    typer.echo(preflight_mod.render(report, measured, shards_done))
+    if report.failures:
+        raise typer.Exit(1)
 
 
 @app.command("import")

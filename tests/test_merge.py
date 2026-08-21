@@ -120,3 +120,36 @@ def test_blank_chunks_do_not_break_the_merge_of_their_neighbours():
     assert len(merged) == 1
     assert merged[0].metadata["merged_from"] == 2
     assert merged[0].metadata["source_chunk_ids"] == ["0", "2"]
+
+
+def test_shard_columns_resolve_across_schema_variants():
+    """The source dataset is not schema-uniform.
+
+    Shard 1184 of 1,380 names its chunk ordinal `chunk_index` where every other shard
+    uses `chunk_id`. A fixed column list failed on that one shard with
+    `ArrowInvalid: No match for FieldRef.Name(chunk_id)` and killed a staging run at
+    86%. All 1,380 shard schemas were surveyed; this is the only variant.
+    """
+    from finvec.sources.sec10k import resolve_columns
+
+    canonical = [
+        "ticker", "cik", "sic", "sic_description", "fiscal_year", "chunk_id",
+        "is_table", "text", "token_count", "is_boilerplate",
+    ]
+    assert resolve_columns(canonical)["chunk_id"] == "chunk_id"
+
+    variant = [c if c != "chunk_id" else "chunk_index" for c in canonical]
+    assert resolve_columns(variant)["chunk_id"] == "chunk_index"
+    # Everything else still maps to itself.
+    resolved = resolve_columns(variant)
+    assert resolved["text"] == "text" and resolved["fiscal_year"] == "fiscal_year"
+
+
+def test_unknown_schema_fails_loudly_naming_the_missing_field():
+    # Silently dropping `text` would produce records that are wrong rather than
+    # absent, which is worse than a hard failure.
+    from finvec.sources.sec10k import resolve_columns
+
+    with pytest.raises(ValueError, match=r"missing required field\(s\) \['text'\]"):
+        resolve_columns(["ticker", "cik", "sic", "sic_description", "fiscal_year",
+                         "chunk_id", "is_table", "token_count", "is_boilerplate"])
