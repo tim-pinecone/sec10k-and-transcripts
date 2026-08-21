@@ -31,8 +31,14 @@ while true; do
       live="NOT RUNNING"
     fi
     printf '  process  %s\n' "$live"
-    if (( age > 120 )); then
+    # Staleness is only alarming when nothing is running. A live stage that reports
+    # once per work unit — the uploader emits per part, and a part can take minutes —
+    # legitimately leaves the status file untouched for a while. Crying wolf there
+    # would undo the point of having the indicator at all.
+    if [[ "$live" == "NOT RUNNING" ]] && (( age > 120 )); then
       printf '  \033[31mstale    status is %dm%02ds old — this is not live progress\033[0m\n' $(( age / 60 )) $(( age % 60 ))
+    elif (( age > 120 )); then
+      printf '  updated  %dm%02ds ago (between work units)\n' $(( age / 60 )) $(( age % 60 ))
     else
       printf '  updated  %ds ago\n' "$age"
     fi
