@@ -18,6 +18,24 @@ while true; do
     "$(date +%H:%M:%S)" "$INTERVAL"
 
   if [[ -f "$STATUS" ]]; then
+    # A dead run leaves its last status behind, and a progress bar frozen at 30% reads
+    # exactly like a slow run. Show liveness and staleness explicitly.
+    now=$(date +%s)
+    written=$(stat -f %m "$STATUS")
+    age=$(( now - written ))
+    if [[ -d data/state/run.lock ]] && kill -0 "$(cat data/state/run.lock/pid 2>/dev/null)" 2>/dev/null; then
+      live="running (pid $(cat data/state/run.lock/pid))"
+    elif pgrep -f "finvec stage" >/dev/null 2>&1; then
+      live="running (no lock — started before the lock existed)"
+    else
+      live="NOT RUNNING"
+    fi
+    printf '  process  %s\n' "$live"
+    if (( age > 120 )); then
+      printf '  \033[31mstale    status is %dm%02ds old — this is not live progress\033[0m\n' $(( age / 60 )) $(( age % 60 ))
+    else
+      printf '  updated  %ds ago\n' "$age"
+    fi
     python3 - "$STATUS" <<'PY'
 import json, sys, datetime
 d = json.load(open(sys.argv[1]))

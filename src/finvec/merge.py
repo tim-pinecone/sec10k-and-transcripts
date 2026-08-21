@@ -50,7 +50,13 @@ def merge_records(
     order: merging out-of-order fragments would splice unrelated passages together,
     and the cost of sorting one company's ~10k rows is nothing.
     """
-    ordered = sorted(records, key=_sort_key)
+    # Blank fragments are dropped before grouping. The source contains a small number
+    # of empty and whitespace-only chunks (11 across shards 423-424), and merging them
+    # produces an empty merged record, which OpenAI rejects outright:
+    #   400 Invalid 'input[132]': input cannot be an empty string
+    # A chunk with no text has nothing to retrieve, so dropping it is correct — but it
+    # has to happen here rather than surfacing as a 400 five hours into a run.
+    ordered = sorted((r for r in records if r.text.strip()), key=_sort_key)
     group: list[Record] = []
     group_chars = 0
     key: tuple[Any, ...] | None = None
@@ -58,17 +64,23 @@ def merge_records(
     for record in ordered:
         record_key = _run_key(record)
         if key is not None and record_key != key and group:
-            yield _emit(group)
+            merged = _emit(group)
+            if merged.text.strip():
+                yield merged
             group, group_chars = [], 0
         key = record_key
         group.append(record)
         group_chars += len(record.text)
         if group_chars >= target_chars:
-            yield _emit(group)
+            merged = _emit(group)
+            if merged.text.strip():
+                yield merged
             group, group_chars = [], 0
 
     if group:
-        yield _emit(group)
+        merged = _emit(group)
+        if merged.text.strip():
+            yield merged
 
 
 def _emit(group: list[Record]) -> Record:

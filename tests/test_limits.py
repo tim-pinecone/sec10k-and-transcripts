@@ -62,3 +62,10 @@ def test_index_size_matches_pinecones_documented_example():
 
 def test_metadata_bytes_counts_utf8_not_characters():
     assert metadata_bytes({"a": "é"}) > metadata_bytes({"a": "e"})
+
+
+def test_empty_input_is_rejected_before_a_request_goes_out():
+    from finvec.embed import batch_texts
+
+    with pytest.raises(ValueError, match="empty or whitespace-only"):
+        list(batch_texts([("real", 10), ("   ", 1)]))

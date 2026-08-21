@@ -88,3 +88,35 @@ def test_metadata_carries_the_company_fields_through():
     assert merged["ticker"] == "AAPL"
     assert merged["cik"] == "0000320193"
     assert merged["sic_description"] == "Electronic Computers"
+
+
+def test_blank_fragments_never_reach_the_embedder():
+    """An empty string fails the entire embedding request, not just that record.
+
+    The source carries a small number of empty and whitespace-only chunks; merging
+    them produced an empty merged record and OpenAI answered with
+    `400 Invalid 'input[132]': input cannot be an empty string`, killing a run five
+    hours in.
+    """
+    records = [
+        chunk(0, "real content here"),
+        chunk(1, "   "),
+        chunk(2, ""),
+        chunk(3, "\n\t "),
+    ]
+    merged = list(merge_records(records))
+    assert merged, "the one real chunk should survive"
+    assert all(m.text.strip() for m in merged)
+
+
+def test_a_run_of_only_blank_chunks_yields_nothing():
+    assert list(merge_records([chunk(0, ""), chunk(1, "  ")])) == []
+
+
+def test_blank_chunks_do_not_break_the_merge_of_their_neighbours():
+    # Dropping a blank fragment must not split a run that would otherwise merge.
+    records = [chunk(0, "a" * 300), chunk(1, "   "), chunk(2, "b" * 300)]
+    merged = list(merge_records(records))
+    assert len(merged) == 1
+    assert merged[0].metadata["merged_from"] == 2
+    assert merged[0].metadata["source_chunk_ids"] == ["0", "2"]

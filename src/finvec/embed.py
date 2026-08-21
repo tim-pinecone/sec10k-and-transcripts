@@ -67,7 +67,16 @@ def batch_texts(
     """
     batch: list[int] = []
     tokens = 0
-    for i, (_, count) in enumerate(items):
+    for i, (text, count) in enumerate(items):
+        if not text or not text.strip():
+            # The provider rejects the whole request for one empty string, so a single
+            # blank input kills a 250-record batch. Fail here, naming the position, so
+            # the cause is obvious instead of arriving as a bare 400 mid-run.
+            raise ValueError(
+                f"input {i} is empty or whitespace-only; embedding providers reject "
+                f"empty strings and fail the entire batch. Filter blanks upstream "
+                f"(see merge.merge_records)."
+            )
         if count > MAX_TOKENS_PER_INPUT:
             # Chunking caps every unit far below this, so hitting it means the merge
             # or chunk step is broken. Failing here beats a 400 mid-run.
