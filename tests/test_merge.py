@@ -1,5 +1,7 @@
 """Merging must never blur filter flags or splice unrelated passages together."""
 
+import pytest
+
 from finvec.merge import merge_records
 from finvec.sources.base import Record
 
