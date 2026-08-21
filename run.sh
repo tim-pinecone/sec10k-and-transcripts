@@ -129,13 +129,41 @@ if has_stage preflight; then
   done
   note "keys present · bucket ${S3_BUCKET} · region ${AWS_REGION}"
 
-  # Staging the full corpus needs roughly 30 GB. Finding that out at 90% would be
-  # an expensive way to learn it.
+  # Disk requirement is computed from what staging has actually consumed per shard so
+  # far, not from a constant. A fixed threshold was wrong twice over: it predated the
+  # switch to FTS (which changed the artifact size) and it ignored work already done,
+  # so a resumed run 86% of the way through was refused for needing "40 GB" when it
+  # actually needed ~4.
   avail_gb=$(df -g . | awk 'NR==2 {print $4}')
-  need_gb=$([[ -n "$SHARDS" ]] && echo 2 || echo 40)
-  note "disk free: ${avail_gb} GB (need ~${need_gb} GB)"
+  need_gb=$(uv run python - <<'PY'
+import json, math, os
+from pathlib import Path
+
+TOTAL_SHARDS = 1380
+TRANSIENT_GB = 3          # compaction rewrite + one jsonl.gz part in flight
+
+def dir_bytes(p):
+    return sum(f.stat().st_size for f in Path(p).rglob("*") if f.is_file()) \
+        if Path(p).exists() else 0
+
+ck = Path("data/state/stage-sec.checkpoint.json")
+done = len(json.loads(ck.read_text())) if ck.exists() else 0
+staged = dir_bytes("staging") + dir_bytes("hf_cache")
+
+if done == 0:
+    # Nothing measured yet; fall back to the observed ~13 MB per shard.
+    remaining = TOTAL_SHARDS * 13_000_000
+else:
+    per_shard = staged / done
+    remaining = max(0, (TOTAL_SHARDS - done) * per_shard)
+
+print(max(2, math.ceil(remaining / 1e9) + TRANSIENT_GB))
+PY
+)
+  note "disk free: ${avail_gb} GB (need ~${need_gb} GB for the work that remains)"
   if (( avail_gb < need_gb )); then
     echo "not enough free disk: ${avail_gb} GB available, ~${need_gb} GB needed" >&2
+    echo "reclaim space with: uv run finvec prune sec --apply  (after an upload)" >&2
     exit 1
   fi
 
