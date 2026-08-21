@@ -332,6 +332,13 @@ def upload_cmd(
     _require_dataset(dataset)
     s = settings()
     s.require("s3_bucket")
+    # Written first, while staging still exists: prune deletes the files that import
+    # and verify would otherwise have to glob.
+    manifest = upload_mod.write_manifest(s.staging_dir, dataset, _state_dir())
+    typer.echo(
+        f"manifest: {len(manifest['namespaces'])} namespaces, "
+        f"{manifest['total_documents']:,} documents"
+    )
     with s3_setup.friendly_aws_errors():
         upload_mod.upload(
             s.staging_dir,
@@ -422,18 +429,24 @@ def import_cmd(
     s = settings()
     s.require("s3_bucket", "pinecone_api_key")
 
-    years = (
-        [n.strip() for n in namespaces.split(",") if n.strip()]
-        if namespaces
-        else upload_mod.staged_namespaces(s.staging_dir, dataset)
-    )
+    if namespaces:
+        years, source = [n.strip() for n in namespaces.split(",") if n.strip()], "flag"
+    else:
+        with s3_setup.friendly_aws_errors():
+            years, source = upload_mod.resolve_namespaces(
+                s.staging_dir, dataset, _state_dir(),
+                bucket=s.s3_bucket, prefix=s.s3_prefix, region=s.aws_region,
+            )
     if not years:
         typer.secho(
-            f"no staged years found under {s.staging_dir}/{dataset} — run "
-            f"`finvec stage {dataset}` first.",
+            f"no namespaces found in the manifest, in "
+            f"s3://{s.s3_bucket}/{s.s3_prefix}/{dataset}, or under "
+            f"{s.staging_dir}/{dataset} — run `finvec stage {dataset}` and "
+            f"`finvec upload {dataset}` first.",
             fg=typer.colors.YELLOW,
         )
         raise typer.Exit(1)
+    typer.echo(f"{len(years)} namespace(s) to import, resolved from {source}")
 
     api = fts.ImportClient(_index_host(dataset))
     run = import_run.start_year_imports(
@@ -508,23 +521,46 @@ def verify(
     """
     _require_dataset(dataset)
     s = settings()
-    expected = upload_mod.expected_counts(s.staging_dir, dataset)
+    manifest = upload_mod.load_manifest(_state_dir(), dataset)
+    if manifest:
+        expected = {
+            ns: v["documents"] for ns, v in manifest["namespaces"].items()
+        }
+        baseline = "manifest"
+    else:
+        expected = upload_mod.expected_counts(s.staging_dir, dataset)
+        baseline = "local staging"
     if not expected:
-        typer.echo("nothing staged — nothing to verify")
-        return
+        typer.secho(
+            "no manifest and nothing staged, so imported counts cannot be checked "
+            "for completeness. Reporting what each import reported instead.",
+            fg=typer.colors.YELLOW,
+        )
+        expected = {}
 
     rows, problems = import_run.reconcile(expected, _state_dir())
-    header = f"  {'ns':<6}{'staged':>14}{'imported':>14}{'diff':>12}"
-    typer.echo(header)
+    total_want = (
+        sum(expected.values()) if expected
+        else import_run.expected_total_from_stage(_state_dir(), dataset)
+    )
+    if not expected:
+        baseline = "stage checkpoint (corpus total only)"
+    typer.echo(f"  baseline: {baseline}")
+    typer.echo(f"  {'ns':<6}{'staged':>14}{'imported':>14}{'diff':>12}")
     for namespace, (want, got) in rows.items():
+        if want < 0:
+            typer.echo(f"  {namespace:<6}{'—':>14}{got:>14,}{'—':>12}")
+            continue
         flag = "  <-- MISMATCH" if got != want else ""
         typer.echo(f"  {namespace:<6}{want:>14,}{got:>14,}{got - want:>+12,}{flag}")
-    total_want = sum(w for w, _ in rows.values())
     total_got = sum(g for _, g in rows.values())
     typer.echo(
         f"  {'TOTAL':<6}{total_want:>14,}{total_got:>14,}"
         f"{total_got - total_want:>+12,}"
+        + ("  <-- MISMATCH" if total_got != total_want else "")
     )
+    if total_got != total_want:
+        problems.append("TOTAL")
 
     if problems:
         typer.secho(

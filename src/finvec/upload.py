@@ -12,9 +12,11 @@ Parquet and the remote one is gzipped JSONL.
 
 from __future__ import annotations
 
+import json
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import boto3
 from botocore.exceptions import ClientError
@@ -203,3 +205,103 @@ def expected_counts(staging_dir: Path, dataset: str) -> dict[str, int]:
             path
         ).metadata.num_rows
     return counts
+
+
+# ── Manifest ─────────────────────────────────────────────────────────────────
+# `import` and `verify` used to derive the namespace list and the expected document
+# counts by globbing local staging. But `prune` exists precisely to delete that
+# staging once it is safely in S3 — so running prune before import destroyed the very
+# thing import needed, and the import failed with "no staged years found". A durable
+# manifest breaks that dependency: it is written while staging still exists, and read
+# afterwards regardless of what has been reclaimed.
+
+
+def manifest_path(state_dir: Path, dataset: str) -> Path:
+    return Path(state_dir) / f"manifest-{dataset}.json"
+
+
+def write_manifest(
+    staging_dir: Path, dataset: str, state_dir: Path
+) -> dict[str, Any]:
+    """Record per-namespace document counts while staging still exists."""
+    counts = expected_counts(staging_dir, dataset)
+    files: dict[str, int] = {}
+    for path in staged_files(staging_dir, dataset):
+        files[path.parent.name] = files.get(path.parent.name, 0) + 1
+    manifest = {
+        "dataset": dataset,
+        "namespaces": {
+            ns: {"documents": counts[ns], "files": files.get(ns, 0)}
+            for ns in sorted(counts)
+        },
+        "total_documents": sum(counts.values()),
+    }
+    from .progress import atomic_write_bytes
+
+    atomic_write_bytes(
+        manifest_path(state_dir, dataset),
+        json.dumps(manifest, indent=1).encode(),
+    )
+    return manifest
+
+
+def load_manifest(state_dir: Path, dataset: str) -> dict[str, Any] | None:
+    path = manifest_path(state_dir, dataset)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text())
+
+
+def namespaces_from_s3(
+    bucket: str, prefix: str, dataset: str, region: str = "us-east-1"
+) -> dict[str, int]:
+    """Namespaces present in the bucket, and how many objects each holds.
+
+    S3 is the authoritative answer to "what is about to be imported" — it survives
+    pruning, and it reflects what the importer will actually read.
+    """
+    s3 = boto3.client("s3", region_name=region)
+    root = s3_key(prefix, dataset)
+    found: dict[str, int] = {}
+    token: str | None = None
+    while True:
+        kwargs: dict[str, Any] = {"Bucket": bucket, "Prefix": root + "/"}
+        if token:
+            kwargs["ContinuationToken"] = token
+        response = s3.list_objects_v2(**kwargs)
+        for obj in response.get("Contents", []):
+            parts = obj["Key"].split("/")
+            # …/{dataset}/import-{year}/{year}/part-*.jsonl.gz
+            for i, seg in enumerate(parts):
+                if seg.startswith("import-") and i + 1 < len(parts):
+                    ns = parts[i + 1]
+                    found[ns] = found.get(ns, 0) + 1
+                    break
+        if not response.get("IsTruncated"):
+            return dict(sorted(found.items()))
+        token = response.get("NextContinuationToken")
+
+
+def resolve_namespaces(
+    staging_dir: Path,
+    dataset: str,
+    state_dir: Path,
+    bucket: str = "",
+    prefix: str = "",
+    region: str = "us-east-1",
+) -> tuple[list[str], str]:
+    """Namespaces to import, from the most durable source available.
+
+    Order matters: the manifest is authoritative because it was written while staging
+    was intact; S3 is next because it is what the importer actually reads; local
+    staging is last because prune may legitimately have removed it.
+    """
+    manifest = load_manifest(state_dir, dataset)
+    if manifest and manifest.get("namespaces"):
+        return sorted(manifest["namespaces"]), "manifest"
+    if bucket:
+        from_s3 = namespaces_from_s3(bucket, prefix, dataset, region)
+        if from_s3:
+            return sorted(from_s3), "s3"
+    staged = staged_namespaces(staging_dir, dataset)
+    return staged, "staging"

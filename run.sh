@@ -221,11 +221,6 @@ if has_stage upload; then
   uv run finvec upload sec
 fi
 
-if [[ $PRUNE -eq 1 ]] && has_stage upload; then
-  say "prune — reclaim disk from verified uploads"
-  uv run finvec prune sec --apply
-fi
-
 # ── Pinecone ─────────────────────────────────────────────────────────────────
 if has_stage import; then
   say "import — one bulk import per year namespace"
@@ -234,8 +229,16 @@ if has_stage import; then
 fi
 
 if has_stage verify; then
-  say "verify — per-namespace record counts"
+  say "verify — staged vs imported record counts"
   uv run finvec verify sec
+fi
+
+# Pruning runs LAST. It deletes local staging, which import and verify used to depend
+# on for the namespace list and the expected counts — running it before them made a
+# successful upload break the very next stage.
+if [[ $PRUNE -eq 1 ]] && has_stage upload; then
+  say "prune — reclaim disk from verified uploads"
+  uv run finvec prune sec --apply
 fi
 
 say "done"

@@ -164,6 +164,17 @@ def poll(
     return run
 
 
+def expected_total_from_stage(state_dir: Path, dataset: str) -> int:
+    """Total documents staged, from the stage checkpoint.
+
+    A durable corpus-level baseline that survives pruning even when no manifest was
+    written — enough to prove the corpus arrived whole, if not to attribute a shortfall
+    to a particular year.
+    """
+    checkpoint = Checkpoint(f"stage-{dataset}", state_dir)
+    return checkpoint.totals("records")
+
+
 def reconcile(
     expected: dict[str, int], state_dir: Path
 ) -> tuple[dict[str, tuple[int, int]], list[str]]:
@@ -175,12 +186,16 @@ def reconcile(
     that cannot distinguish a short year from a complete one.
     """
     checkpoint = Checkpoint("imports", state_dir)
+    # Union, so a namespace that was imported but has no baseline still shows up
+    # rather than vanishing from the report.
+    namespaces = sorted(set(expected) | set(checkpoint._done))
     rows: dict[str, tuple[int, int]] = {}
     problems: list[str] = []
-    for namespace in sorted(set(expected) | set()):
+    for namespace in namespaces:
         info = checkpoint.info(namespace)
         imported = info.get("records", 0) if isinstance(info, dict) else 0
-        rows[namespace] = (expected[namespace], imported)
-        if imported != expected[namespace]:
+        want = expected.get(namespace, -1)  # -1 marks "no per-namespace baseline"
+        rows[namespace] = (want, imported)
+        if want >= 0 and imported != want:
             problems.append(namespace)
     return rows, problems
